@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Game</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.css" rel="stylesheet">
+    <style>
+        .game-container {
+            max-width: 1000px;
+            margin: 40px auto;
+            padding: 20px;
+        }
+        #board {
+            width: 600px;
+            margin: 20px auto;
+        }
+        .game-info {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .move-list {
+            height: 300px;
+            overflow-y: auto;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        .status-bar {
+            background: #2a5298;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .highlight-square {
+            box-shadow: inset 0 0 3px 3px yellow;
+        }
+    </style>
+</head>
+<body class="bg-light">
+    <div class="game-container">
+        <div class="status-bar">
+            <div class="d-flex justify-content-between align-items-center">
+                <span>Game #{{ game.id }}</span>
+                <span>{{ game.current_turn|title }}'s Turn</span>
+                <span>{{ game.white_player.username }} vs {{ game.black_player.username }}</span>
+            </div>
+        </div>
+
+        <div class="row">
+            <div class="col-md-8">
+                <div id="board"></div>
+                {% if is_player_turn %}
+                <div class="text-center mt-3">
+                    <button class="btn btn-primary" id="undoBtn">Undo Last Move</button>
+                </div>
+                {% endif %}
+            </div>
+            <div class="col-md-4">
+                <div class="game-info">
+                    <h4>Move History</h4>
+                    <div class="move-list" id="moveList">
+                        {% for move in game.moves.all %}
+                        <div class="move-item">
+                            {{ move.player.username }}: {{ move.piece }} from {{ move.from_square }} to {{ move.to_square }}
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chessboard-js/1.0.0/chessboard-1.0.0.min.js"></script>
+    <script>
+        let board = null;
+        let game = null;
+        let selectedSquare = null;
+
+        function initializeBoard() {
+            game = new Chess('{{ game.game_state }}');
+            board = Chessboard('board', {
+                position: '{{ game.game_state }}',
+                draggable: true,
+                pieceTheme: function(piece) {
+                    const color = piece.charAt(0);
+                    const pieceType = piece.charAt(1).toLowerCase();
+                    const colorSuffix = color === 'w' ? 'l' : 'd';
+                    return `/static/img/chesspieces/wikipedia/Chess_${pieceType}${colorSuffix}t60.png`;
+                },
+                onDragStart: onDragStart,
+                onDrop: onDrop,
+                onSnapEnd: onSnapEnd
+            });
+            $(window).resize(board.resize);
+
+            // Add click handlers for piece selection
+            $('.square-55d63').on('click', function() {
+                const square = $(this).data('square');
+                const piece = game.get(square);
+                const currentTurn = '{{ game.current_turn }}';
+
+                // Clear previous highlights
+                $('.square-55d63').removeClass('highlight-square');
+
+                if (!selectedSquare) {
+                    // Check if the clicked square has a piece and it's the correct turn
+                    if (piece && (
+                        (currentTurn === 'white' && piece.color === 'w') ||
+                        (currentTurn === 'black' && piece.color === 'b')
+                    )) {
+                        selectedSquare = square;
+                        $(this).addClass('highlight-square');
+                    }
+                } else {
+                    const source = selectedSquare;
+                    const target = square;
+                    
+                    // Validate move using chess.js before sending to server
+                    const move = game.move({
+                        from: source,
+                        to: target,
+                        promotion: 'q' // Always promote to queen for simplicity
+                    });
+
+                    // If move is invalid, clear selection and return
+                    if (move === null) {
+                        selectedSquare = null;
+                        return;
+                    }
+
+                    // Undo the move since we'll let the server validate it
+                    game.undo();
+                    selectedSquare = null;
+
+                    // If move is valid locally, send to server
+                    if (source !== target) {
+                        onDrop(source, target);
+                    }
+                }
+            });
+        }
+
+        function onDragStart(source, piece) {
+            const currentTurn = '{{ game.current_turn }}';
+            if ((currentTurn === 'white' && piece.search(/^b/) !== -1) ||
+                (currentTurn === 'black' && piece.search(/^w/) !== -1)) {
+                return false;
+            }
+            return true;
+        }
+
+        function onDrop(source, target) {
+            // Store the current position for potential rollback
+            const currentPosition = game.fen();
+            
+            // Let the server validate the move
+            const piece = game.get(source);
+            
+            // Send the move to the server
+            $.ajax({
+                url: '/game/{{ game.id }}/move/',
+                method: 'POST',
+                data: {
+                    from: source,
+                    to: target,
+                    csrfmiddlewaretoken: '{{ csrf_token }}'
+                },
+                success: function(response) {
+                    if (response.status === 'error') {
+                        // Revert the move if server reports an error
+                        game.undo();
+                        board.position(currentPosition);
+                        alert(response.error);
+                        return;
+                    }
+
+                    // Update the game state with the server's response
+                    if (response.game_state) {
+                        game.load(response.game_state);
+                        board.position(game.fen());
+                    }
+
+                    // Update move list for player's move
+                    const moveList = document.getElementById('moveList');
+                    const moveItem = document.createElement('div');
+                    moveItem.className = 'move-item';
+                    moveItem.textContent = `${response.current_turn === 'black' ? 'White' : 'Black'}: ${piece ? piece.type.toUpperCase() : 'Piece'} from ${source} to ${target}`;
+                    moveList.appendChild(moveItem);
+                    moveList.scrollTop = moveList.scrollHeight;
+
+                    // Handle bot move if present
+                    if (response.bot_move) {
+                        setTimeout(() => {
+                            game.load(response.game_state);
+                            board.position(game.fen());
+
+                            const botMoveItem = document.createElement('div');
+                            botMoveItem.className = 'move-item';
+                            botMoveItem.textContent = `Black: ${response.bot_move.piece} from ${response.bot_move.from} to ${response.bot_move.to}`;
+                            moveList.appendChild(botMoveItem);
+                            moveList.scrollTop = moveList.scrollHeight;
+                        }, 500);
+                    }
+
+                    // Handle game state notifications
+                    if (response.is_checkmate) {
+                        alert('Checkmate! Game Over!');
+                        board.draggable = false;
+                    } else if (response.is_stalemate) {
+                        alert('Stalemate! Game is drawn.');
+                        board.draggable = false;
+                    } else if (response.is_insufficient_material) {
+                        alert('Draw due to insufficient material!');
+                        board.draggable = false;
+                    } else if (response.is_check) {
+                        alert('Check!');
+                    }
+
+                    // Update the turn display
+                    $('.status-bar span:nth-child(2)').text(response.current_turn.charAt(0).toUpperCase() + response.current_turn.slice(1) + "'s Turn");
+                },
+                error: function(xhr) {
+                    // On error, revert to the original position
+                    game.undo();
+                    board.position(currentPosition);
+                    alert('Error making move. Please try again.');
+                }
+            });
+        }
+
+        function onSnapEnd() {
+            board.position(game.fen());
+        }
+
+        $('#undoBtn').click(function() {
+            game.undo();
+            board.position(game.fen());
+        });
+
+        $(document).ready(function() {
+            initializeBoard();
+        });
+    </script>
+</body>
+</html>
